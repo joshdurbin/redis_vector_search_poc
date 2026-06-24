@@ -1,0 +1,22 @@
+# Binary
+redis_vector_search_poc
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+
+# Data
+product.csv

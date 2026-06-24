@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package products;
+
+option go_package = "github.com/joshdurbin/redis_vector_search_poc/gen;gen";
+
+service ProductsService {
+  rpc Ingest(IngestRequest)          returns (IngestResponse);
+  rpc Load(LoadRequest)              returns (stream LoadProgress);
+  rpc Search(SearchRequest)          returns (SearchResponse);
+  rpc Similar(SimilarRequest)        returns (SearchResponse);
+  rpc Rerank(RerankRequest)          returns (RerankResponse);
+  rpc Fusion(FusionRequest)          returns (SearchResponse);
+  rpc Range(RangeRequest)            returns (RangeResponse);
+}
+
+message Product {
+  string product_id   = 1;
+  string product_name = 2;
+  string category     = 3;
+  string description  = 4;
+  double rating       = 5;
+  double score        = 6;
+}
+
+message IngestRequest {
+  string product_id   = 1;
+  string product_name = 2;
+  string category     = 3;
+  string description  = 4;
+  double rating       = 5;
+}
+
+message IngestResponse {
+  string status     = 1;
+  string product_id = 2;
+}
+
+// content is the raw file bytes; format is "csv" or "json"
+message LoadRequest {
+  bytes  content = 1;
+  string format  = 2;
+}
+
+message LoadProgress {
+  bool   done        = 1;
+  int32  progress    = 2;
+  int32  total_so_far = 3;
+  int32  loaded      = 4;
+  int32  skipped     = 5;
+  string error       = 6;
+}
+
+message SearchRequest {
+  string query    = 1;
+  int32  top_n    = 2;
+  string not      = 3;
+  string category = 4;
+}
+
+message SearchResponse {
+  repeated Product results            = 1;
+  int32            count              = 2;
+  int32            fusion_query_count = 3;
+}
+
+message SimilarRequest {
+  string product_id = 1;
+  int32  top_n      = 2;
+}
+
+message RerankRequest {
+  string query          = 1;
+  int32  top_n          = 2;
+  string rerank_by      = 3;
+  double rerank_weight  = 4;
+}
+
+message RerankResult {
+  string product_id   = 1;
+  string product_name = 2;
+  string category     = 3;
+  string description  = 4;
+  double rating       = 5;
+  double vector_score = 6;
+  double final_score  = 7;
+}
+
+message RerankResponse {
+  repeated RerankResult results = 1;
+  int32                 count   = 2;
+}
+
+message FusionRequest {
+  repeated string queries  = 1;
+  int32           top_n    = 2;
+  string          category = 3;
+}
+
+message RangeRequest {
+  string query        = 1;
+  double max_distance = 2;
+  int32  limit        = 3;
+  string category     = 4;
+}
+
+message RangeResponse {
+  repeated Product results      = 1;
+  int32            count        = 2;
+  double           max_distance = 3;
+}
