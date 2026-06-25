@@ -9,15 +9,15 @@ flowchart LR
     CLI["load CLI\n(./redis_vector_search_poc load)"]
     Client["gRPC Client\n(grpcurl / ghz / app)"]
     Server["gRPC Server\n(redis_vector_search_poc serve)"]
-    Embed["Embedding API\n(OpenAI-compatible)"]
-    Cache[("Redis\nemb:* cache")]
-    Index[("Redis\nHNSW Index")]
+    Embed["4-bit Quantized\nEmbedding Model\n(Qwen3-Embedding-0.6B-4bit-DWQ)"]
+    Cache[("Redis\nFP32 embedding cache\nemb:{model}:{sha256}")]
+    Index[("Redis\nHNSW Index\n1024-dim FLOAT32\nCOSINE distance")]
 
     CLI -->|"Ingest RPC per row"| Server
     Client -->|"Search / Similar / Rerank\nFusion / Range / Ingest"| Server
-    Server <-->|"embed text"| Embed
-    Server <-->|"cache lookup / write"| Cache
-    Server <-->|"HSET / KNN / RANGE"| Index
+    Server <-->|"name+desc → 1024×FP32 vector"| Embed
+    Server <-->|"4,096-byte blob cache lookup / write"| Cache
+    Server <-->|"HSET product: / KNN / VECTOR_RANGE"| Index
 ```
 
 ### Ingest flow
@@ -26,19 +26,23 @@ flowchart LR
 sequenceDiagram
     participant C as Client
     participant S as gRPC Server
-    participant E as Embedding API
+    participant E as Embedding Model (4-bit weights → FP32 output)
     participant R as Redis
 
     C->>S: Ingest(product_id, name, category, description, rating)
-    S->>R: GET emb:{model}:{sha256(name+desc)}
+    S->>S: concat name + " " + description
+    S->>S: SHA-256(text) → cache key emb:{model}:{hash}
+    S->>R: GET emb:{model}:{hash}
     alt cache hit
-        R-->>S: float32 vector bytes
+        R-->>S: 4,096-byte FP32 blob (1024 floats)
+        S->>S: BytesToFloat32Slice → []float32
     else cache miss
-        S->>E: POST /v1/embeddings
-        E-->>S: float32 vector
-        S->>R: SET emb:{model}:{sha256} vector
+        S->>E: POST /v1/embeddings (text)
+        E-->>S: 1024×float64 (FP32 output from 4-bit model)
+        S->>S: cast float64→float32, Float32SliceToBytes → 4,096 bytes
+        S->>R: SET emb:{model}:{hash} 4,096-byte blob (no TTL)
     end
-    S->>R: HSET product:{product_id} fields + vector
+    S->>R: HSET product:{product_id} fields + embedding blob
     S-->>C: {status:"ok", product_id:"…"}
 ```
 
@@ -48,19 +52,115 @@ sequenceDiagram
 sequenceDiagram
     participant C as Client
     participant S as gRPC Server
-    participant E as Embedding API
+    participant E as Embedding Model (4-bit weights → FP32 output)
     participant R as Redis
 
     C->>S: Search(query, top_n, category?, not?)
-    S->>E: embed(query)
+    S->>E: embed(query) → 1024×FP32 query_vec
     opt not != ""
-        S->>E: embed(not)
-        S->>S: vec = L2Normalize(query_vec − not_vec)
+        S->>E: embed(not) → 1024×FP32 not_vec
+        S->>S: query_vec = L2Normalize(query_vec − not_vec)
+        note over S: steers concept-space direction<br/>away from unwanted concept
     end
-    S->>R: FT.SEARCH … KNN top_n [FILTER @category=={…}]
-    R-->>S: product hashes + cosine distances
+    S->>S: Float32SliceToBytes(query_vec) → $vec param
+    S->>R: FT.SEARCH … KNN top_n @embedding $vec [FILTER @category==…]
+    note over R: HNSW graph walk,<br/>cosine distance scoring
+    R-->>S: product hashes + cosine distances (0=identical, 1=opposite)
     S-->>C: SearchResponse{results[], count}
 ```
+
+## Vector internals
+
+### Representation
+
+Every product in the catalog is reduced to a list of 1024 numbers — a `[]float32` — called its **embedding**. That list is a coordinate in 1024-dimensional space where position encodes meaning: "Julie Solid Wood Sleigh Bed" and "Pine Panel Bed Frame" end up numerically close to each other; "Julie Solid Wood Sleigh Bed" and "Stainless Steel Mixing Bowl" end up far apart.
+
+The embedding model (`Qwen3-Embedding-0.6B-4bit-DWQ`) has its internal weights stored in 4-bit to reduce memory and speed up inference, but it always outputs FP32. Once the service receives the 1024 floats, everything downstream — caching, storage, math, search — works in FP32.
+
+### Byte translation
+
+Redis stores binary blobs; Go vectors are `[]float32`. Every time a vector crosses that boundary `store.go` converts between the two representations:
+
+- **`Float32SliceToBytes`** — writes each float as its 4-byte IEEE 754 little-endian representation. 1024 floats × 4 bytes = **4,096 bytes per product**.
+- **`BytesToFloat32Slice`** — reads 4 bytes at a time and reconstructs each float via `math.Float32frombits`.
+
+The round-trip is lossless. The same 4,096-byte blob written to Redis is bit-for-bit identical when read back, which matters because even tiny floating-point drift would shift cosine distances and make cached embeddings behave differently from freshly-computed ones.
+
+### Ingest
+
+The text fed to the model is `product_name + " " + description` — not category or rating. Category and rating are stored as ordinary Redis hash fields alongside the vector and are only used for filtering and reranking later.
+
+1. SHA-256 the concatenated text → check Redis for `emb:{model}:{hash}`.
+2. **Cache hit**: deserialize the 4,096 bytes back to `[]float32`, skip the API call.
+3. **Cache miss**: POST to the embedding API, cast the response `[]float64` → `[]float32`, write bytes to the cache key with no TTL.
+4. `HSET product:{product_id}` with all fields, storing the embedding as the raw byte blob.
+
+The cache key includes the model name, so swapping models silently bypasses old entries — they stay in Redis but are never matched. Because the key is derived from the text, identical descriptions across different product IDs share one cached embedding.
+
+### Search
+
+The query string goes through the same embedding path — same model, same cache check. The resulting `[]float32` is serialized to bytes and passed to Redis as the `$vec` parameter:
+
+```
+*=>[KNN 5 @embedding $vec AS __score]
+```
+
+Redis walks the HNSW graph it built at index time, comparing the query vector against stored product vectors using **cosine distance**. Cosine distance measures the angle between two vectors, ignoring magnitude — two descriptions of the same product at different lengths still land close together. The returned `__score` is cosine distance: `0` = identical direction, `1` = opposite.
+
+#### Negative steering (`not`)
+
+When a `not` phrase is supplied the service:
+
+1. Embeds the phrase into its own `[]float32`.
+2. Subtracts it from the query vector element-by-element (`vek32.Sub`).
+3. L2-normalizes the result back to unit length (`vek32.Norm` then `vek32.DivNumber`).
+
+```
+final_vec = L2Normalize(query_vec − not_vec)
+```
+
+Subtraction moves the query point away from the unwanted concept in embedding space. Renormalizing ensures the result still behaves as a direction vector for cosine distance — HNSW assumes unit vectors. The modified vector is then passed to KNN exactly like a normal query; Redis has no awareness it was computed via subtraction.
+
+### Similar
+
+No embedding API call is made. The service reads the source product's stored embedding directly with `HGETALL product:{product_id}`, deserializes the `embedding` field from bytes to `[]float32`, and passes it straight to `KNNSearch` with `excludeID` set so the source product is not returned as its own top result.
+
+This makes Similar cheaper than Search: one Redis hash read plus a KNN query, no embedding round-trip.
+
+### Rerank
+
+Rerank runs a larger KNN first (the `rerank_pool`, default 50 candidates) then re-scores entirely in Go using a linear blend of vector similarity and normalized rating:
+
+```
+sim  = 1 − cosine_distance
+norm = (rating − min_rating) / (max_rating − min_rating)
+
+final_score = (1 − weight) × sim + weight × norm
+```
+
+Min/max normalization is computed across the 50 candidates returned from Redis, not the full catalog. A 4.9-star product in a pool where everything is 4.7–5.0 gets a normalized rating near 1.0, while that same product in a pool spanning 1.0–5.0 scores ~0.97. Vector score drives initial recall; rating blends in at sort time in Go.
+
+### Fusion
+
+Each query in `queries` is embedded independently. `store.AverageVectors` then:
+
+1. Sums each dimension across all vectors.
+2. Divides element-wise by the count (mean).
+3. L2-normalizes the result.
+
+The normalized average sits geometrically between all the query concepts. Querying "standing desk", "ergonomic chair", and "monitor arm" together produces a single vector in the "productive office setup" region of concept-space — closer to products that partially match all three than to products that perfectly match just one. The L2 normalization is essential: averaging un-normalized vectors would bias toward whichever query has the largest magnitude.
+
+### Range
+
+Instead of returning the N closest products, Range returns everything within a cosine distance threshold. The Redis query is:
+
+```
+@embedding:[VECTOR_RANGE $dist $vec]=>[KNN {limit} @embedding $vec AS __score]
+```
+
+`VECTOR_RANGE` is the gate; the `KNN` inside it scores and orders what passed through. Because this is HNSW (approximate), products at the edge of the threshold may be missed — the graph traversal does not guarantee it visits every node within range. A `max_distance` of `0.25` corresponds to roughly a 66° angle between vectors; products at `0.26` might be genuinely relevant but are dropped. This is the tradeoff accepted with approximate nearest-neighbor in exchange for millisecond search over tens of thousands of products. Tune `EF_RUNTIME` on the index to increase recall at the cost of higher latency.
+
+---
 
 ## Prerequisites
 
