@@ -1,23 +1,23 @@
-# Redis Vector Search POC
+# Vector Search POC
 
-A gRPC server that embeds product data as vectors via an OpenAI-compatible embedding API, stores them in Redis using HNSW vector search, and exposes semantic search endpoints.
+A gRPC server that embeds product data as vectors via an OpenAI-compatible embedding API, stores them in SQLite using [sqlite-vec](https://github.com/asg017/sqlite-vec) HNSW vector search, and exposes semantic search endpoints.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    CLI["load CLI\n(./redis_vector_search_poc load)"]
+    CLI["load CLI\n(./vector_search_poc load)"]
     Client["gRPC Client\n(grpcurl / ghz / app)"]
-    Server["gRPC Server\n(redis_vector_search_poc serve)"]
+    Server["gRPC Server\n(vector_search_poc serve)"]
     Embed["4-bit Quantized\nEmbedding Model\n(Qwen3-Embedding-0.6B-4bit-DWQ)"]
-    Cache[("Redis\nFP32 embedding cache\nemb:{model}:{sha256}")]
-    Index[("Redis\nHNSW Index\n1024-dim FLOAT32\nCOSINE distance")]
+    Cache[("SQLite\nembedding_cache table\nemb:{model}:{sha256}")]
+    Index[("SQLite\nvec0 HNSW Index\n1024-dim FLOAT32\nL2 distance")]
 
     CLI -->|"Ingest RPC per row"| Server
     Client -->|"Search / Similar / Rerank\nFusion / Range / Ingest"| Server
     Server <-->|"name+desc → 1024×FP32 vector"| Embed
     Server <-->|"4,096-byte blob cache lookup / write"| Cache
-    Server <-->|"HSET product: / KNN / VECTOR_RANGE"| Index
+    Server <-->|"INSERT / KNN MATCH / VECTOR_RANGE"| Index
 ```
 
 ### Ingest flow
@@ -27,22 +27,22 @@ sequenceDiagram
     participant C as Client
     participant S as gRPC Server
     participant E as Embedding Model (4-bit weights → FP32 output)
-    participant R as Redis
+    participant DB as SQLite (sqlite-vec)
 
     C->>S: Ingest(product_id, name, category, description, rating)
     S->>S: concat name + " " + description
     S->>S: SHA-256(text) → cache key emb:{model}:{hash}
-    S->>R: GET emb:{model}:{hash}
+    S->>DB: SELECT embedding FROM embedding_cache WHERE cache_key=?
     alt cache hit
-        R-->>S: 4,096-byte FP32 blob (1024 floats)
+        DB-->>S: 4,096-byte FP32 blob (1024 floats)
         S->>S: BytesToFloat32Slice → []float32
     else cache miss
         S->>E: POST /v1/embeddings (text)
         E-->>S: 1024×float64 (FP32 output from 4-bit model)
         S->>S: cast float64→float32, Float32SliceToBytes → 4,096 bytes
-        S->>R: SET emb:{model}:{hash} 4,096-byte blob (no TTL)
+        S->>DB: INSERT OR REPLACE INTO embedding_cache (cache_key, embedding)
     end
-    S->>R: HSET product:{product_id} fields + embedding blob
+    S->>DB: INSERT OR REPLACE INTO products + product_vectors (vec0)
     S-->>C: {status:"ok", product_id:"…"}
 ```
 
@@ -53,7 +53,7 @@ sequenceDiagram
     participant C as Client
     participant S as gRPC Server
     participant E as Embedding Model (4-bit weights → FP32 output)
-    participant R as Redis
+    participant DB as SQLite (sqlite-vec)
 
     C->>S: Search(query, top_n, category?, not?)
     S->>E: embed(query) → 1024×FP32 query_vec
@@ -62,10 +62,9 @@ sequenceDiagram
         S->>S: query_vec = L2Normalize(query_vec − not_vec)
         note over S: steers concept-space direction<br/>away from unwanted concept
     end
-    S->>S: Float32SliceToBytes(query_vec) → $vec param
-    S->>R: FT.SEARCH … KNN top_n @embedding $vec [FILTER @category==…]
-    note over R: HNSW graph walk,<br/>cosine distance scoring
-    R-->>S: product hashes + cosine distances (0=identical, 1=opposite)
+    S->>DB: SELECT … FROM product_vectors WHERE embedding MATCH ? ORDER BY distance LIMIT ?
+    note over DB: HNSW graph walk via vec0,<br/>L2 distance scoring
+    DB-->>S: product rows + distances
     S-->>C: SearchResponse{results[], count}
 ```
 
@@ -79,33 +78,37 @@ The embedding model (`Qwen3-Embedding-0.6B-4bit-DWQ`) has its internal weights s
 
 ### Byte translation
 
-Redis stores binary blobs; Go vectors are `[]float32`. Every time a vector crosses that boundary `store.go` converts between the two representations:
+SQLite stores vector data as binary blobs; Go vectors are `[]float32`. Every time a vector crosses that boundary `store.go` converts between the two representations:
 
 - **`Float32SliceToBytes`** — writes each float as its 4-byte IEEE 754 little-endian representation. 1024 floats × 4 bytes = **4,096 bytes per product**.
 - **`BytesToFloat32Slice`** — reads 4 bytes at a time and reconstructs each float via `math.Float32frombits`.
 
-The round-trip is lossless. The same 4,096-byte blob written to Redis is bit-for-bit identical when read back, which matters because even tiny floating-point drift would shift cosine distances and make cached embeddings behave differently from freshly-computed ones.
+The round-trip is lossless. The same 4,096-byte blob written to the database is bit-for-bit identical when read back, which matters because even tiny floating-point drift would shift distances and make cached embeddings behave differently from freshly-computed ones.
 
 ### Ingest
 
-The text fed to the model is `product_name + " " + description` — not category or rating. Category and rating are stored as ordinary Redis hash fields alongside the vector and are only used for filtering and reranking later.
+The text fed to the model is `product_name + " " + description` — not category or rating. Category and rating are stored as ordinary columns in the `products` table alongside the vector and are only used for filtering and reranking later.
 
-1. SHA-256 the concatenated text → check Redis for `emb:{model}:{hash}`.
+1. SHA-256 the concatenated text → check `embedding_cache` for `emb:{model}:{hash}`.
 2. **Cache hit**: deserialize the 4,096 bytes back to `[]float32`, skip the API call.
-3. **Cache miss**: POST to the embedding API, cast the response `[]float64` → `[]float32`, write bytes to the cache key with no TTL.
-4. `HSET product:{product_id}` with all fields, storing the embedding as the raw byte blob.
+3. **Cache miss**: POST to the embedding API, cast the response `[]float64` → `[]float32`, write bytes to the cache table with no expiry.
+4. `INSERT OR REPLACE` into `products` and into the `product_vectors` vec0 virtual table.
 
-The cache key includes the model name, so swapping models silently bypasses old entries — they stay in Redis but are never matched. Because the key is derived from the text, identical descriptions across different product IDs share one cached embedding.
+The cache key includes the model name, so swapping models silently bypasses old entries — they remain in the database but are never matched. Because the key is derived from the text, identical descriptions across different product IDs share one cached embedding.
 
 ### Search
 
-The query string goes through the same embedding path — same model, same cache check. The resulting `[]float32` is serialized to bytes and passed to Redis as the `$vec` parameter:
+The query string goes through the same embedding path — same model, same cache check. The resulting `[]float32` is passed to sqlite-vec as a MATCH query against the `product_vectors` vec0 table:
 
-```
-*=>[KNN 5 @embedding $vec AS __score]
+```sql
+SELECT rowid, distance
+FROM product_vectors
+WHERE embedding MATCH ?
+ORDER BY distance
+LIMIT ?
 ```
 
-Redis walks the HNSW graph it built at index time, comparing the query vector against stored product vectors using **cosine distance**. Cosine distance measures the angle between two vectors, ignoring magnitude — two descriptions of the same product at different lengths still land close together. The returned `__score` is cosine distance: `0` = identical direction, `1` = opposite.
+sqlite-vec walks the HNSW graph built at insert time, comparing the query vector against stored product vectors using **L2 (Euclidean) distance**. Lower distance = more similar.
 
 #### Negative steering (`not`)
 
@@ -119,26 +122,26 @@ When a `not` phrase is supplied the service:
 final_vec = L2Normalize(query_vec − not_vec)
 ```
 
-Subtraction moves the query point away from the unwanted concept in embedding space. Renormalizing ensures the result still behaves as a direction vector for cosine distance — HNSW assumes unit vectors. The modified vector is then passed to KNN exactly like a normal query; Redis has no awareness it was computed via subtraction.
+Subtraction moves the query point away from the unwanted concept in embedding space. The modified vector is then passed to KNN exactly like a normal query.
 
 ### Similar
 
-No embedding API call is made. The service reads the source product's stored embedding directly with `HGETALL product:{product_id}`, deserializes the `embedding` field from bytes to `[]float32`, and passes it straight to `KNNSearch` with `excludeID` set so the source product is not returned as its own top result.
+No embedding API call is made. The service reads the source product's stored embedding directly from `products JOIN product_vectors`, deserializes the blob to `[]float32`, and passes it straight to `KNNSearch` with `excludeID` set so the source product is not returned as its own top result.
 
-This makes Similar cheaper than Search: one Redis hash read plus a KNN query, no embedding round-trip.
+This makes Similar cheaper than Search: one database read plus a KNN query, no embedding round-trip.
 
 ### Rerank
 
 Rerank runs a larger KNN first (the `rerank_pool`, default 50 candidates) then re-scores entirely in Go using a linear blend of vector similarity and normalized rating:
 
 ```
-sim  = 1 − cosine_distance
+sim  = 1 − distance   (approximated from L2 score)
 norm = (rating − min_rating) / (max_rating − min_rating)
 
 final_score = (1 − weight) × sim + weight × norm
 ```
 
-Min/max normalization is computed across the 50 candidates returned from Redis, not the full catalog. A 4.9-star product in a pool where everything is 4.7–5.0 gets a normalized rating near 1.0, while that same product in a pool spanning 1.0–5.0 scores ~0.97. Vector score drives initial recall; rating blends in at sort time in Go.
+Min/max normalization is computed across the 50 candidates, not the full catalog. Vector score drives initial recall; rating blends in at sort time in Go.
 
 ### Fusion
 
@@ -148,47 +151,37 @@ Each query in `queries` is embedded independently. `store.AverageVectors` then:
 2. Divides element-wise by the count (mean).
 3. L2-normalizes the result.
 
-The normalized average sits geometrically between all the query concepts. Querying "standing desk", "ergonomic chair", and "monitor arm" together produces a single vector in the "productive office setup" region of concept-space — closer to products that partially match all three than to products that perfectly match just one. The L2 normalization is essential: averaging un-normalized vectors would bias toward whichever query has the largest magnitude.
+The normalized average sits geometrically between all the query concepts. Querying "standing desk", "ergonomic chair", and "monitor arm" together produces a single vector in the "productive office setup" region of concept-space — closer to products that partially match all three than to products that perfectly match just one.
 
 ### Range
 
-Instead of returning the N closest products, Range returns everything within a cosine distance threshold. The Redis query is:
+Instead of returning the N closest products, Range returns everything within a distance threshold. sqlite-vec is queried with a KNN bound and results are then filtered in Go to those within `max_distance`:
 
-```
-@embedding:[VECTOR_RANGE $dist $vec]=>[KNN {limit} @embedding $vec AS __score]
+```sql
+SELECT rowid, distance
+FROM product_vectors
+WHERE embedding MATCH ?
+ORDER BY distance
+LIMIT ?
 ```
 
-`VECTOR_RANGE` is the gate; the `KNN` inside it scores and orders what passed through. Because this is HNSW (approximate), products at the edge of the threshold may be missed — the graph traversal does not guarantee it visits every node within range. A `max_distance` of `0.25` corresponds to roughly a 66° angle between vectors; products at `0.26` might be genuinely relevant but are dropped. This is the tradeoff accepted with approximate nearest-neighbor in exchange for millisecond search over tens of thousands of products. Tune `EF_RUNTIME` on the index to increase recall at the cost of higher latency.
+Because this is HNSW (approximate), products at the edge of the threshold may be missed — the graph traversal does not guarantee it visits every node within range. This is the tradeoff accepted with approximate nearest-neighbor in exchange for millisecond search over tens of thousands of products.
 
 ---
 
 ## Prerequisites
 
-- Go 1.25+
-- Redis 8+ with Query Engine / vector search support
+- Go 1.25+ with CGO enabled (required by `mattn/go-sqlite3`)
+- `sqlc` v1.31+ (only if regenerating database query code: `brew install sqlc`)
 - An OpenAI-compatible embedding server (defaults to `http://localhost:8000/v1/`)
 - `grpcurl` for manual querying
 - `ghz` for performance benchmarking
 - `protoc`, `protoc-gen-go`, `protoc-gen-go-grpc` (only for regenerating proto code)
 
-### Redis
-
-Redis 8 ships vector search built-in. The Homebrew `redis` formula does not include the query engine — use Docker or `redis-stack`:
-
-```bash
-# Option A — Docker (Redis Stack)
-docker run -d --name redis -p 6379:6379 redis/redis-stack-server:latest
-
-# Option B — Homebrew Redis Stack
-brew tap redis-stack/redis-stack
-brew install redis-stack
-brew services start redis-stack
-```
-
 ## Build
 
 ```bash
-make            # builds ./redis_vector_search_poc
+make            # builds ./vector_search_poc (CGO_ENABLED=1 automatically)
 make proto      # regenerates Go code from products.proto
 make clean      # removes binary and generated proto code
 make run        # build + serve
@@ -203,9 +196,7 @@ Config is read from `config.yaml` in the working directory. Any key can be overr
 |-----|---------|-------------|
 | `server.host` | `""` (all interfaces) | `APP_SERVER_HOST` |
 | `server.port` | `8080` | `APP_SERVER_PORT` |
-| `redis.addr` | `localhost:6379` | `APP_REDIS_ADDR` |
-| `redis.password` | `""` | `APP_REDIS_PASSWORD` |
-| `redis.db` | `0` | `APP_REDIS_DB` |
+| `sqlite.path` | `products.db` | `APP_SQLITE_PATH` |
 | `olmx.base_url` | `http://localhost:8000/v1/` | `APP_OLMX_BASE_URL` |
 | `olmx.api_key` | `""` | `APP_OLMX_API_KEY` |
 | `olmx.embedding_model` | `Qwen3-Embedding-0.6B-4bit-DWQ` | `APP_OLMX_EMBEDDING_MODEL` |
@@ -221,8 +212,8 @@ Example `config.yaml`:
 ```yaml
 server:
   port: 8080
-redis:
-  addr: "localhost:6379"
+sqlite:
+  path: "products.db"
 olmx:
   base_url: "http://localhost:8000/v1/"
   api_key: "your-key"
@@ -234,11 +225,11 @@ search:
 ## Starting the server
 
 ```bash
-./redis_vector_search_poc serve
+./vector_search_poc serve
 
 # All flags (override config/env)
-./redis_vector_search_poc serve \
-  --redis-addr localhost:6379 \
+./vector_search_poc serve \
+  --sqlite-path products.db \
   --olmx-base-url http://localhost:8000/v1/ \
   --olmx-api-key your-key \
   --olmx-model Qwen3-Embedding-0.6B-4bit-DWQ \
@@ -248,33 +239,26 @@ search:
   -vv       # trace logging
 ```
 
-The server creates the Redis HNSW index on startup if it does not already exist, then serves gRPC on the configured address.
+The server initializes the SQLite schema on startup (WAL mode, vec0 virtual table, embedding cache table), then serves gRPC on the configured address.
 
 ## Loading data
 
-The `load` subcommand reads a local comma-delimited CSV file, calls `Ingest` over gRPC for each row, and stores the embedded product in Redis. The server must be running before loading.
+The `load` subcommand reads a local tab-delimited or CSV file, calls `Ingest` over gRPC for each row, and stores the embedded product. The server must be running before loading.
 
 ```bash
-./redis_vector_search_poc load data/products.csv
+./vector_search_poc load product.csv
 
 # Limit rows and target a non-default server
-./redis_vector_search_poc load data/products.csv --rows 500 --addr localhost:8080
+./vector_search_poc load product.csv --rows 500 --addr localhost:8080
 ```
-
-**Supported format:** comma-delimited CSV only. TSV, JSON, JSONL, gzip, and remote URLs are not supported.
 
 ### WANDS dataset
 
-`make pull-data` downloads the Wayfair WANDS product dataset. The downloaded file is tab-delimited — convert it to comma-delimited CSV before loading:
+`make pull-data` downloads the Wayfair WANDS product dataset (tab-delimited). The loader handles tab-delimited files directly — no conversion needed.
 
 ```bash
 make pull-data
-
-# Strip commas from field values then convert tabs to commas
-awk 'BEGIN{FS="\t"; OFS=","} { for(i=1;i<=NF;i++) gsub(/,/," ",$i); print }' \
-  product.csv > products_comma.csv
-
-./redis_vector_search_poc load products_comma.csv
+./vector_search_poc load product.csv
 ```
 
 The loader maps WANDS column names to the canonical schema automatically:
@@ -299,7 +283,7 @@ grpcurl -plaintext localhost:8080 describe products.ProductsService
 
 ### Ingest — add a single product
 
-Embeds the product and stores it in Redis.
+Embeds the product and stores it in the vector index.
 
 ```bash
 grpcurl -plaintext -d '{
@@ -328,7 +312,7 @@ grpcurl -plaintext -d '{
   "top_n": 5
 }' localhost:8080 products.ProductsService/Search
 
-# With category filter (TAG match on the Redis index)
+# With category filter
 grpcurl -plaintext -d '{
   "query":    "wooden bed frame",
   "top_n":    10,
@@ -369,7 +353,7 @@ Response:
 }
 ```
 
-`score` is cosine distance — lower is more similar (0 = identical, 1 = opposite).
+`score` is L2 distance — lower is more similar.
 
 ---
 
@@ -390,7 +374,7 @@ Returns the same shape as Search.
 
 ### Rerank — blend vector score with a numeric field
 
-Fetches a larger candidate pool (`search.rerank_pool`, default 50), then re-ranks by blending cosine similarity with a normalised field value. Only `rating` is supported as `rerank_by`.
+Fetches a larger candidate pool (`search.rerank_pool`, default 50), then re-ranks by blending vector similarity with a normalised field value. Only `rating` is supported as `rerank_by`.
 
 ```bash
 grpcurl -plaintext -d '{
@@ -453,7 +437,7 @@ Response includes `fusionQueryCount`:
 
 ### Range — return all products within a distance threshold
 
-Uses Redis `VECTOR_RANGE` to find every product within `max_distance` cosine distance of the query. Results are approximate (HNSW).
+Returns every product within `max_distance` of the query vector. Results are approximate (HNSW).
 
 ```bash
 grpcurl -plaintext -d '{
@@ -471,7 +455,7 @@ grpcurl -plaintext -d '{
 }' localhost:8080 products.ProductsService/Range
 ```
 
-`max_distance` is cosine distance (0.0 = identical, 1.0 = opposite). `limit` caps results (max 500, default 100).
+`max_distance` is L2 distance. `limit` caps results (max 500, default 100).
 
 Response:
 
@@ -491,7 +475,7 @@ Sends raw CSV file bytes to the server which embeds and stores each product. The
 
 ```bash
 grpcurl -plaintext -d "{
-  \"content\": \"$(base64 < data/products.csv)\",
+  \"content\": \"$(base64 < product.csv)\",
   \"format\":  \"csv\"
 }" localhost:8080 products.ProductsService/Load
 ```
@@ -557,7 +541,6 @@ ghz --insecure \
 ### Similar
 
 ```bash
-# Requires a product_id already in the index
 ghz --insecure \
   --call products.ProductsService.Similar \
   --data '{"product_id":"1502","top_n":5}' \
@@ -623,32 +606,28 @@ Latency distribution:
 ## Project structure
 
 ```
-cmd/redis-vector-search-poc/
+cmd/vector-search-poc/
   main.go       — root cobra command, zerolog setup
   serve.go      — serve subcommand + flag binding
-  load.go       — load subcommand, CSV parsing and ingestion
+  load.go       — load subcommand, CSV/TSV parsing and ingestion
 internal/
   config/       — Config structs, viper loading
-  embeddings/   — Embed() with Redis cache (key: emb:{model}:{sha256})
-  store/        — Redis client, HNSW index, KNN/range search, vector math
+  embeddings/   — Embed() with pluggable EmbeddingCache interface
+  store/
+    store.go    — Store interface + shared types (Product, Result) + vector math
+    sqlite.go   — SQLiteStore: vec0 HNSW via sqlite-vec MATCH
+    sqlcgen/    — sqlc-generated code for products + embedding_cache tables (do not edit)
   server/
     server.go   — gRPC server, request/response interceptors
     service.go  — all RPC implementations
 gen/            — protobuf-generated Go (do not edit)
+schema/         — SQLite DDL (input to sqlc)
+queries/        — SQL queries (input to sqlc)
+sqlc.yaml       — sqlc configuration
 products.proto  — service and message definitions
 Makefile
 ```
 
 ## Embedding cache
 
-Identical text+model combinations are cached in Redis as raw `FLOAT32` bytes with no TTL:
-
-```
-key: emb:{model}:{sha256(text)}
-```
-
-Cache hits are logged at debug level (`-v`). To clear the cache:
-
-```bash
-redis-cli --scan --pattern "emb:*" | xargs redis-cli del
-```
+Identical text+model combinations are cached keyed by `emb:{model}:{sha256(text)}` in the `embedding_cache` table of the same `.db` file. Cache hits are logged at debug level (`-v`).

@@ -1036,7 +1036,7 @@ const file_products_proto_rawDesc = "" +
 	"\aSimilar\x12\x18.products.SimilarRequest\x1a\x18.products.SearchResponse\x12;\n" +
 	"\x06Rerank\x12\x17.products.RerankRequest\x1a\x18.products.RerankResponse\x12;\n" +
 	"\x06Fusion\x12\x17.products.FusionRequest\x1a\x18.products.SearchResponse\x128\n" +
-	"\x05Range\x12\x16.products.RangeRequest\x1a\x17.products.RangeResponseB7Z5github.com/joshdurbin/redis_vector_search_poc/gen;genb\x06proto3"
+	"\x05Range\x12\x16.products.RangeRequest\x1a\x17.products.RangeResponseB1Z/github.com/joshdurbin/vector_search_poc/gen;genb\x06proto3"
 
 var (
 	file_products_proto_rawDescOnce sync.Once

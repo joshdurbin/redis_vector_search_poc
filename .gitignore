@@ -1,5 +1,5 @@
 # Binary
-redis_vector_search_poc
+vector_search_poc
 
 # Go build artifacts
 *.exe
@@ -20,3 +20,6 @@ redis_vector_search_poc
 
 # Data
 product.csv
+*.db
+*.db-shm
+*.db-wal

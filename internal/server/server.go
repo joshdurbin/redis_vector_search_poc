@@ -6,12 +6,11 @@ import (
 	"net"
 	"time"
 
-	"github.com/joshdurbin/redis_vector_search_poc/internal/config"
-	"github.com/joshdurbin/redis_vector_search_poc/internal/store"
-	pb "github.com/joshdurbin/redis_vector_search_poc/gen"
+	"github.com/joshdurbin/vector_search_poc/internal/config"
+	"github.com/joshdurbin/vector_search_poc/internal/store"
+	pb "github.com/joshdurbin/vector_search_poc/gen"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
-	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
@@ -20,7 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func Start(cfg config.Config, rdb *redis.Client) {
+func Start(cfg config.Config, st store.Store) {
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -40,7 +39,7 @@ func Start(cfg config.Config, rdb *redis.Client) {
 		)
 	}
 	grpcServer := grpc.NewServer(opts...)
-	pb.RegisterProductsServiceServer(grpcServer, &svc{cfg: cfg, rdb: rdb, oaiClient: &oaiClient})
+	pb.RegisterProductsServiceServer(grpcServer, &svc{cfg: cfg, store: st, oaiClient: &oaiClient})
 	reflection.Register(grpcServer)
 
 	log.Info().Str("addr", addr).Msg("gRPC server listening")
@@ -80,13 +79,9 @@ func logRPC(method string, dur time.Duration, err error) {
 		Msg("rpc")
 }
 
-// svc keeps store unexported; Start wires it to the gRPC server.
 type svc struct {
 	pb.UnimplementedProductsServiceServer
 	cfg       config.Config
-	rdb       *redis.Client
+	store     store.Store
 	oaiClient *openai.Client
 }
-
-// Ensure store import is used at compile time.
-var _ = store.Product{}

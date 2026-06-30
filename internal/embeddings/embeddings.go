@@ -5,22 +5,25 @@ import (
 	"crypto/sha256"
 	"fmt"
 
-	"github.com/joshdurbin/redis_vector_search_poc/internal/store"
+	"github.com/joshdurbin/vector_search_poc/internal/store"
 	"github.com/openai/openai-go"
-	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 )
 
-// Embed returns a vector for text using the provided client and model, caching
-// results in Redis keyed by model+sha256(text). The client should be
-// constructed once at startup and reused across calls.
-func Embed(ctx context.Context, client *openai.Client, model string, text string, rdb *redis.Client) ([]float32, error) {
+// EmbeddingCache is satisfied by the Store interface.
+type EmbeddingCache interface {
+	GetCachedEmbedding(ctx context.Context, key string) ([]float32, bool, error)
+	SetCachedEmbedding(ctx context.Context, key string, vec []float32) error
+}
+
+// Embed returns a vector for text, caching results keyed by model+sha256(text).
+func Embed(ctx context.Context, client *openai.Client, model string, text string, cache EmbeddingCache) ([]float32, error) {
 	cacheKey := fmt.Sprintf("emb:%s:%x", model, sha256.Sum256([]byte(text)))
 
-	if rdb != nil {
-		if b, err := rdb.Get(ctx, cacheKey).Bytes(); err == nil {
+	if cache != nil {
+		if vec, ok, err := cache.GetCachedEmbedding(ctx, cacheKey); err == nil && ok {
 			log.Debug().Str("key", cacheKey).Msg("embedding cache hit")
-			return store.BytesToFloat32Slice(b), nil
+			return vec, nil
 		}
 	}
 
@@ -41,8 +44,8 @@ func Embed(ctx context.Context, client *openai.Client, model string, text string
 		vec[i] = float32(v)
 	}
 
-	if rdb != nil {
-		if err := rdb.Set(ctx, cacheKey, store.Float32SliceToBytes(vec), 0).Err(); err != nil {
+	if cache != nil {
+		if err := cache.SetCachedEmbedding(ctx, cacheKey, vec); err != nil {
 			log.Warn().Err(err).Str("key", cacheKey).Msg("failed to cache embedding")
 		} else {
 			log.Debug().Str("key", cacheKey).Msg("embedding cached")
@@ -51,3 +54,6 @@ func Embed(ctx context.Context, client *openai.Client, model string, text string
 
 	return vec, nil
 }
+
+// compile-time check: store.Store satisfies EmbeddingCache
+var _ EmbeddingCache = (store.Store)(nil)

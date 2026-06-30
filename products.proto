@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package products;
 
-option go_package = "github.com/joshdurbin/redis_vector_search_poc/gen;gen";
+option go_package = "github.com/joshdurbin/vector_search_poc/gen;gen";
 
 service ProductsService {
   rpc Ingest(IngestRequest)          returns (IngestResponse);

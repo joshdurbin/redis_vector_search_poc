@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := build
 
-BINARY  := redis_vector_search_poc
+BINARY  := vector_search_poc
 GEN_DIR := gen
 PROTO   := products.proto
 
@@ -19,7 +19,7 @@ proto:
 		$(PROTO)
 
 build:
-	go build -o $(BINARY) ./cmd/redis-vector-search-poc/
+	CGO_ENABLED=1 go build -o $(BINARY) ./cmd/vector-search-poc/
 
 clean:
 	rm -f $(BINARY)

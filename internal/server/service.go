@@ -9,9 +9,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/joshdurbin/redis_vector_search_poc/internal/embeddings"
-	"github.com/joshdurbin/redis_vector_search_poc/internal/store"
-	pb "github.com/joshdurbin/redis_vector_search_poc/gen"
+	"github.com/joshdurbin/vector_search_poc/internal/embeddings"
+	"github.com/joshdurbin/vector_search_poc/internal/store"
+	pb "github.com/joshdurbin/vector_search_poc/gen"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -22,7 +22,7 @@ func (s *svc) Ingest(ctx context.Context, req *pb.IngestRequest) (*pb.IngestResp
 		return nil, status.Error(codes.InvalidArgument, "product_id, product_name, and description are required")
 	}
 
-	vec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, req.ProductName+" "+req.Description, s.rdb)
+	vec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, req.ProductName+" "+req.Description, s.store)
 	if err != nil {
 		log.Error().Err(err).Msg("embed error")
 		return nil, status.Error(codes.Internal, "embedding failed")
@@ -36,7 +36,7 @@ func (s *svc) Ingest(ctx context.Context, req *pb.IngestRequest) (*pb.IngestResp
 		Rating:      req.Rating,
 		Embedding:   vec,
 	}
-	if err := store.UpsertProduct(ctx, s.rdb, p); err != nil {
+	if err := s.store.UpsertProduct(ctx, p); err != nil {
 		log.Error().Err(err).Str("product_id", req.ProductId).Msg("upsert error")
 		return nil, status.Error(codes.Internal, "storage failed")
 	}
@@ -65,14 +65,14 @@ func (s *svc) Search(ctx context.Context, req *pb.SearchRequest) (*pb.SearchResp
 		topN = s.cfg.Search.DefaultTopN
 	}
 
-	vec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, req.Query, s.rdb)
+	vec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, req.Query, s.store)
 	if err != nil {
 		log.Error().Err(err).Msg("embed error")
 		return nil, status.Error(codes.Internal, "embedding failed")
 	}
 
 	if req.Not != "" {
-		notVec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, req.Not, s.rdb)
+		notVec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, req.Not, s.store)
 		if err != nil {
 			log.Error().Err(err).Msg("embed not-vector error")
 			return nil, status.Error(codes.Internal, "embedding failed")
@@ -80,7 +80,7 @@ func (s *svc) Search(ctx context.Context, req *pb.SearchRequest) (*pb.SearchResp
 		vec = store.L2Normalize(store.SubtractVectors(vec, notVec))
 	}
 
-	results, err := store.KNNSearch(ctx, s.rdb, s.cfg, vec, topN, req.Category, "")
+	results, err := s.store.KNNSearch(ctx, vec, topN, req.Category, "")
 	if err != nil {
 		log.Error().Err(err).Msg("knn search error")
 		return nil, status.Error(codes.Internal, "search failed")
@@ -97,7 +97,7 @@ func (s *svc) Similar(ctx context.Context, req *pb.SimilarRequest) (*pb.SearchRe
 		topN = s.cfg.Search.DefaultTopN
 	}
 
-	vec, _, err := store.GetProductEmbedding(ctx, s.rdb, req.ProductId)
+	vec, _, err := s.store.GetProductEmbedding(ctx, req.ProductId)
 	if err != nil {
 		log.Error().Err(err).Str("product_id", req.ProductId).Msg("get embedding error")
 		return nil, status.Error(codes.Internal, "storage error")
@@ -106,7 +106,7 @@ func (s *svc) Similar(ctx context.Context, req *pb.SimilarRequest) (*pb.SearchRe
 		return nil, status.Error(codes.NotFound, "product not found")
 	}
 
-	results, err := store.KNNSearch(ctx, s.rdb, s.cfg, vec, topN, "", req.ProductId)
+	results, err := s.store.KNNSearch(ctx, vec, topN, "", req.ProductId)
 	if err != nil {
 		log.Error().Err(err).Msg("knn search error")
 		return nil, status.Error(codes.Internal, "search failed")
@@ -126,7 +126,6 @@ func (s *svc) Rerank(ctx context.Context, req *pb.RerankRequest) (*pb.RerankResp
 	if rerankBy == "" {
 		rerankBy = "rating"
 	}
-	// Only "rating" is supported. Additional NUMERIC fields (e.g. "popularity") could be added here.
 	if rerankBy != "rating" {
 		return nil, status.Error(codes.InvalidArgument, "rerank_by only supports 'rating'")
 	}
@@ -134,13 +133,13 @@ func (s *svc) Rerank(ctx context.Context, req *pb.RerankRequest) (*pb.RerankResp
 		return nil, status.Error(codes.InvalidArgument, "rerank_weight must be between 0 and 1")
 	}
 
-	vec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, req.Query, s.rdb)
+	vec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, req.Query, s.store)
 	if err != nil {
 		log.Error().Err(err).Msg("embed error")
 		return nil, status.Error(codes.Internal, "embedding failed")
 	}
 
-	candidates, err := store.KNNSearch(ctx, s.rdb, s.cfg, vec, s.cfg.Search.RerankPool, "", "")
+	candidates, err := s.store.KNNSearch(ctx, vec, s.cfg.Search.RerankPool, "", "")
 	if err != nil {
 		log.Error().Err(err).Msg("knn search error")
 		return nil, status.Error(codes.Internal, "search failed")
@@ -192,7 +191,7 @@ func (s *svc) Fusion(ctx context.Context, req *pb.FusionRequest) (*pb.SearchResp
 	// TODO: parallelize embedding calls
 	vecs := make([][]float32, 0, len(req.Queries))
 	for _, q := range req.Queries {
-		vec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, q, s.rdb)
+		vec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, q, s.store)
 		if err != nil {
 			log.Error().Err(err).Str("query", q).Msg("embed error")
 			return nil, status.Error(codes.Internal, "embedding failed")
@@ -200,7 +199,7 @@ func (s *svc) Fusion(ctx context.Context, req *pb.FusionRequest) (*pb.SearchResp
 		vecs = append(vecs, vec)
 	}
 
-	results, err := store.KNNSearch(ctx, s.rdb, s.cfg, store.AverageVectors(vecs), topN, req.Category, "")
+	results, err := s.store.KNNSearch(ctx, store.AverageVectors(vecs), topN, req.Category, "")
 	if err != nil {
 		log.Error().Err(err).Msg("knn search error")
 		return nil, status.Error(codes.Internal, "search failed")
@@ -227,13 +226,13 @@ func (s *svc) Range(ctx context.Context, req *pb.RangeRequest) (*pb.RangeRespons
 		limit = 500
 	}
 
-	vec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, req.Query, s.rdb)
+	vec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, req.Query, s.store)
 	if err != nil {
 		log.Error().Err(err).Msg("embed error")
 		return nil, status.Error(codes.Internal, "embedding failed")
 	}
 
-	results, err := store.RangeSearch(ctx, s.rdb, s.cfg, vec, req.MaxDistance, limit, req.Category)
+	results, err := s.store.RangeSearch(ctx, vec, req.MaxDistance, limit, req.Category)
 	if err != nil {
 		log.Error().Err(err).Msg("range search error")
 		return nil, status.Error(codes.Internal, "search failed")
@@ -310,7 +309,7 @@ func (s *svc) loadCSV(ctx context.Context, r io.Reader, send func(*pb.LoadProgre
 			continue
 		}
 
-		vec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, p.ProductName+" "+p.Description, s.rdb)
+		vec, err := embeddings.Embed(ctx, s.oaiClient, s.cfg.Olmx.EmbeddingModel, p.ProductName+" "+p.Description, s.store)
 		if err != nil {
 			log.Error().Err(err).Str("product_id", p.ProductID).Msg("embed error")
 			skipped++
@@ -318,7 +317,7 @@ func (s *svc) loadCSV(ctx context.Context, r io.Reader, send func(*pb.LoadProgre
 		}
 		p.Embedding = vec
 
-		if err := store.UpsertProduct(ctx, s.rdb, p); err != nil {
+		if err := s.store.UpsertProduct(ctx, p); err != nil {
 			log.Error().Err(err).Str("product_id", p.ProductID).Msg("upsert error")
 			skipped++
 			continue
@@ -333,4 +332,3 @@ func (s *svc) loadCSV(ctx context.Context, r io.Reader, send func(*pb.LoadProgre
 	}
 	return loaded, skipped, nil
 }
-

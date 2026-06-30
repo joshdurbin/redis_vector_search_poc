@@ -9,7 +9,7 @@ import (
 
 type Config struct {
 	Server ServerConfig
-	Redis  RedisConfig
+	SQLite SQLiteConfig
 	Olmx   OlmxConfig
 	Search SearchConfig
 }
@@ -20,10 +20,8 @@ type ServerConfig struct {
 	LogRequests bool
 }
 
-type RedisConfig struct {
-	Addr     string
-	Password string
-	DB       int
+type SQLiteConfig struct {
+	Path string
 }
 
 type OlmxConfig struct {
@@ -34,7 +32,6 @@ type OlmxConfig struct {
 
 type SearchConfig struct {
 	DefaultTopN int
-	IndexName   string
 	VectorDim   int
 	RerankPool  int
 }
@@ -47,13 +44,10 @@ func Load() Config {
 	viper.SetDefault("server.host", "")
 	viper.SetDefault("server.port", 8080)
 	viper.SetDefault("server.log_requests", false)
-	viper.SetDefault("redis.addr", "localhost:6379")
-	viper.SetDefault("redis.password", "")
-	viper.SetDefault("redis.db", 0)
+	viper.SetDefault("sqlite.path", "products.db")
 	viper.SetDefault("olmx.base_url", "http://localhost:8000/v1/")
 	viper.SetDefault("olmx.embedding_model", "Qwen3-Embedding-0.6B-4bit-DWQ")
 	viper.SetDefault("search.default_top_n", 5)
-	viper.SetDefault("search.index_name", "products")
 	viper.SetDefault("search.vector_dim", 1024)
 	viper.SetDefault("search.rerank_pool", 50)
 
@@ -73,10 +67,8 @@ func Load() Config {
 			Port:        viper.GetInt("server.port"),
 			LogRequests: viper.GetBool("server.log_requests"),
 		},
-		Redis: RedisConfig{
-			Addr:     viper.GetString("redis.addr"),
-			Password: viper.GetString("redis.password"),
-			DB:       viper.GetInt("redis.db"),
+		SQLite: SQLiteConfig{
+			Path: viper.GetString("sqlite.path"),
 		},
 		Olmx: OlmxConfig{
 			BaseURL:        viper.GetString("olmx.base_url"),
@@ -85,7 +77,6 @@ func Load() Config {
 		},
 		Search: SearchConfig{
 			DefaultTopN: viper.GetInt("search.default_top_n"),
-			IndexName:   viper.GetString("search.index_name"),
 			VectorDim:   viper.GetInt("search.vector_dim"),
 			RerankPool:  viper.GetInt("search.rerank_pool"),
 		},
